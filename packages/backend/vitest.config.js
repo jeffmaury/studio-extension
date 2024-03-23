@@ -27,6 +27,7 @@ const config = {
     coverage: {
       provider: 'v8',
       reporter: ['lcov', 'text'],
+      extension: '.ts',
     },
 },
 resolve: {

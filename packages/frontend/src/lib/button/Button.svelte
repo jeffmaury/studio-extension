@@ -19,7 +19,7 @@ export let padding: string = type !== 'tab' ? 'px-4 py-[5px]' : 'px-4 pb-1';
 let iconType: string | undefined = undefined;
 
 onMount(() => {
-  if (icon?.prefix === 'fas') {
+  if (['fas', 'fab'].includes(icon?.prefix)) {
     iconType = 'fa';
   } else {
     iconType = 'unknown';
@@ -66,14 +66,14 @@ $: {
   aria-label="{$$props['aria-label']}"
   on:click
   disabled="{disabled || inProgress}">
-  {#if icon}
+  {#if icon || inProgress}
     <div class="flex flex-row p-0 m-0 bg-transparent justify-center items-center space-x-[4px]">
       {#if inProgress}
         <Spinner size="1em" />
       {:else if iconType === 'fa'}
         <Fa icon="{icon}" />
       {:else if iconType === 'unknown'}
-        <svelte:component this="{icon}" />
+        <svelte:component this="{icon}" size="1em" />
       {/if}
       {#if $$slots.default}
         <span><slot /></span>

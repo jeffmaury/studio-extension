@@ -20,7 +20,7 @@
 
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { Studio } from './studio';
-import type { ExtensionContext } from '@podman-desktop/api';
+import { type ExtensionContext, EventEmitter } from '@podman-desktop/api';
 
 import * as fs from 'node:fs';
 
@@ -32,8 +32,18 @@ const mockedExtensionContext = {
 
 const studio = new Studio(mockedExtensionContext);
 
+const mocks = vi.hoisted(() => ({
+  listContainers: vi.fn(),
+  getContainerConnections: vi.fn(),
+  postMessage: vi.fn(),
+}));
+
 vi.mock('@podman-desktop/api', async () => {
   return {
+    fs: {
+      createFileSystemWatcher: vi.fn(),
+    },
+    EventEmitter: vi.fn(),
     Uri: class {
       static joinPath = () => ({ fsPath: '.' });
     },
@@ -42,9 +52,24 @@ vi.mock('@podman-desktop/api', async () => {
         webview: {
           html: '',
           onDidReceiveMessage: vi.fn(),
-          postMessage: vi.fn(),
+          postMessage: mocks.postMessage,
         },
+        onDidChangeViewState: vi.fn(),
       }),
+    },
+    env: {
+      createTelemetryLogger: () => ({
+        logUsage: vi.fn(),
+      }),
+    },
+    containerEngine: {
+      onEvent: vi.fn(),
+      listContainers: mocks.listContainers,
+    },
+    provider: {
+      onDidRegisterContainerConnection: vi.fn(),
+      onDidUpdateContainerConnection: vi.fn(),
+      getContainerConnections: mocks.getContainerConnections,
     },
   };
 });
@@ -56,6 +81,13 @@ const consoleLogMock = vi.fn();
 beforeEach(() => {
   vi.clearAllMocks();
   console.log = consoleLogMock;
+
+  vi.mocked(EventEmitter).mockReturnValue({
+    event: vi.fn(),
+    fire: vi.fn(),
+  } as unknown as EventEmitter<unknown>);
+
+  mocks.postMessage.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -63,6 +95,8 @@ afterEach(() => {
 });
 
 test('check activate ', async () => {
+  mocks.listContainers.mockReturnValue([]);
+  mocks.getContainerConnections.mockReturnValue([]);
   vi.spyOn(fs.promises, 'readFile').mockImplementation(() => {
     return Promise.resolve('<html></html>');
   });

@@ -18,18 +18,24 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import { beforeEach, describe, expect, test, vi } from 'vitest';
-import content from './ai-test.json';
-import userContent from './ai-user-test.json';
+import { beforeEach, expect, test, vi } from 'vitest';
+import content from './tests/ai-test.json';
+import userContent from './tests/ai-user-test.json';
 import type { ApplicationManager } from './managers/applicationManager';
-import type { RecipeStatusRegistry } from './registries/RecipeStatusRegistry';
 import { StudioApiImpl } from './studio-api-impl';
-import type { PlayGroundManager } from './managers/playground';
-import type { Webview } from '@podman-desktop/api';
+import type { InferenceManager } from './managers/inference/inferenceManager';
+import type { TelemetryLogger, Webview } from '@podman-desktop/api';
+import { EventEmitter } from '@podman-desktop/api';
 import { CatalogManager } from './managers/catalogManager';
 import type { ModelsManager } from './managers/modelsManager';
 
 import * as fs from 'node:fs';
+import { timeout } from './utils/utils';
+import type { TaskRegistry } from './registries/TaskRegistry';
+import type { LocalRepositoryRegistry } from './registries/LocalRepositoryRegistry';
+import type { Recipe } from '@shared/src/models/IRecipe';
+import type { PlaygroundV2Manager } from './managers/playgroundV2Manager';
+import type { SnippetManager } from './managers/SnippetManager';
 
 vi.mock('./ai.json', () => {
   return {
@@ -46,8 +52,22 @@ vi.mock('node:fs', () => {
   };
 });
 
-vi.mock('@podman-desktop/api', () => {
+const mocks = vi.hoisted(() => ({
+  withProgressMock: vi.fn(),
+  showWarningMessageMock: vi.fn(),
+  deleteApplicationMock: vi.fn(),
+}));
+
+vi.mock('@podman-desktop/api', async () => {
   return {
+    EventEmitter: vi.fn(),
+    window: {
+      withProgress: mocks.withProgressMock,
+      showWarningMessage: mocks.showWarningMessageMock,
+    },
+    ProgressLocation: {
+      TASK_WIDGET: 'TASK_WIDGET',
+    },
     fs: {
       createFileSystemWatcher: () => ({
         onDidCreate: vi.fn(),
@@ -59,70 +79,67 @@ vi.mock('@podman-desktop/api', () => {
 });
 
 let studioApiImpl: StudioApiImpl;
-let catalogManager;
+let catalogManager: CatalogManager;
 
 beforeEach(async () => {
+  vi.resetAllMocks();
+
   const appUserDirectory = '.';
 
   // Creating CatalogManager
-  catalogManager = new CatalogManager(appUserDirectory, {
-    postMessage: vi.fn(),
-  } as unknown as Webview);
+  catalogManager = new CatalogManager(
+    {
+      postMessage: vi.fn().mockResolvedValue(undefined),
+    } as unknown as Webview,
+    appUserDirectory,
+  );
 
   // Creating StudioApiImpl
   studioApiImpl = new StudioApiImpl(
-    appUserDirectory,
-    {} as unknown as ApplicationManager,
-    {} as unknown as RecipeStatusRegistry,
-    {} as unknown as PlayGroundManager,
+    {
+      deleteApplication: mocks.deleteApplicationMock,
+    } as unknown as ApplicationManager,
     catalogManager,
     {} as unknown as ModelsManager,
+    {} as TelemetryLogger,
+    {} as LocalRepositoryRegistry,
+    {} as unknown as TaskRegistry,
+    {} as unknown as InferenceManager,
+    {} as unknown as PlaygroundV2Manager,
+    {} as unknown as SnippetManager,
   );
-  vi.resetAllMocks();
   vi.mock('node:fs');
+
+  const listeners: ((value: unknown) => void)[] = [];
+
+  vi.mocked(EventEmitter).mockReturnValue({
+    event: vi.fn().mockImplementation(callback => {
+      listeners.push(callback);
+    }),
+    fire: vi.fn().mockImplementation((content: unknown) => {
+      listeners.forEach(listener => listener(content));
+    }),
+  } as unknown as EventEmitter<unknown>);
 });
 
-describe('invalid user catalog', () => {
-  beforeEach(async () => {
-    vi.spyOn(fs.promises, 'readFile').mockResolvedValue('invalid json');
-    await catalogManager.loadCatalog();
-  });
-
-  test('expect correct model is returned with valid id', async () => {
-    const model = await studioApiImpl.getModelById('llama-2-7b-chat.Q5_K_S');
-    expect(model).toBeDefined();
-    expect(model.name).toEqual('Llama-2-7B-Chat-GGUF');
-    expect(model.registry).toEqual('Hugging Face');
-    expect(model.url).toEqual(
-      'https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q5_K_S.gguf',
-    );
-  });
-
-  test('expect error if id does not correspond to any model', async () => {
-    await expect(() => studioApiImpl.getModelById('unknown')).rejects.toThrowError('No model found having id unknown');
-  });
-});
-
-test('expect correct model is returned from default catalog with valid id when no user catalog exists', async () => {
-  vi.spyOn(fs, 'existsSync').mockReturnValue(false);
-  await catalogManager.loadCatalog();
-  const model = await studioApiImpl.getModelById('llama-2-7b-chat.Q5_K_S');
-  expect(model).toBeDefined();
-  expect(model.name).toEqual('Llama-2-7B-Chat-GGUF');
-  expect(model.registry).toEqual('Hugging Face');
-  expect(model.url).toEqual(
-    'https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q5_K_S.gguf',
-  );
-});
-
-test('expect correct model is returned with valid id when the user catalog is valid', async () => {
+test('expect pull application to call the withProgress api method', async () => {
   vi.spyOn(fs, 'existsSync').mockReturnValue(true);
   vi.spyOn(fs.promises, 'readFile').mockResolvedValue(JSON.stringify(userContent));
 
-  await catalogManager.loadCatalog();
-  const model = await studioApiImpl.getModelById('model1');
-  expect(model).toBeDefined();
-  expect(model.name).toEqual('Model 1');
-  expect(model.registry).toEqual('Hugging Face');
-  expect(model.url).toEqual('https://model1.example.com');
+  mocks.withProgressMock.mockResolvedValue(undefined);
+
+  catalogManager.init();
+  await vi.waitUntil(() => catalogManager.getRecipes().length > 0);
+  await studioApiImpl.pullApplication('recipe 1', 'model1');
+  expect(mocks.withProgressMock).toHaveBeenCalledOnce();
+});
+
+test('requestRemoveApplication should ask confirmation', async () => {
+  vi.spyOn(catalogManager, 'getRecipeById').mockReturnValue({
+    name: 'Recipe 1',
+  } as unknown as Recipe);
+  mocks.showWarningMessageMock.mockResolvedValue('Confirm');
+  await studioApiImpl.requestRemoveApplication('recipe-id-1', 'model-id-1');
+  await timeout(0);
+  expect(mocks.deleteApplicationMock).toHaveBeenCalled();
 });

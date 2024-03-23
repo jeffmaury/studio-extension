@@ -18,6 +18,27 @@
 
 import * as net from 'net';
 
+export async function getFreeRandomPort(address: string): Promise<number> {
+  const server = net.createServer();
+  return new Promise((resolve, reject) =>
+    server
+      .on('error', (error: NodeJS.ErrnoException) => reject(error))
+      .on('listening', () => {
+        const addr = server.address();
+        if (typeof addr === 'string') {
+          // this should not happen, as it is only for pipes and unix domain sockets
+          server.close(() => reject(new Error('error getting allocated port')));
+        } else {
+          // not sure what the call to close will do on the addr value
+          // => the port value is saved before to call close
+          const allocatedPort = addr.port;
+          server.close(() => resolve(allocatedPort));
+        }
+      })
+      .listen(0, address),
+  );
+}
+
 /**
  * Find a free port starting from the given port
  */
@@ -36,67 +57,26 @@ export async function getFreePort(port = 0): Promise<number> {
   return port;
 }
 
-/**
- * Find a free port range
- */
-export async function getFreePortRange(rangeSize: number): Promise<string> {
-  let port = 9000;
-  let startPort = port;
-
-  do {
-    if (await isFreePort(port)) {
-      ++port;
-    } else {
-      ++port;
-      startPort = port;
-    }
-  } while (port + 1 - startPort <= rangeSize);
-
-  return `${startPort}-${port - 1}`;
-}
-
-export function isFreePort(port: number): Promise<boolean> {
+function isFreeAddressPort(address: string, port: number): Promise<boolean> {
   const server = net.createServer();
   return new Promise((resolve, reject) =>
     server
       .on('error', (error: NodeJS.ErrnoException) => (error.code === 'EADDRINUSE' ? resolve(false) : reject(error)))
       .on('listening', () => server.close(() => resolve(true)))
-      .listen(port, '127.0.0.1'),
+      .listen(port, address),
   );
 }
 
-export async function getPortsInfo(portDescriptor: string): Promise<string | undefined> {
-  // check if portDescriptor is a range of ports
-  if (portDescriptor.includes('-')) {
-    return await getPortRange(portDescriptor);
-  } else {
-    const localPort = await getPort(portDescriptor);
-    if (!localPort) {
-      return undefined;
-    }
-    return `${localPort}`;
-  }
+export async function isFreePort(port: number): Promise<boolean> {
+  return (await isFreeAddressPort('127.0.0.1', port)) && (await isFreeAddressPort('0.0.0.0', port));
 }
 
-/**
- * return a range of the same length as portDescriptor containing free ports
- * undefined if the portDescriptor range is not valid
- * e.g 5000:5001 -> 9000:9001
- */
-async function getPortRange(portDescriptor: string): Promise<string | undefined> {
-  const rangeValues = getStartEndRange(portDescriptor);
-  if (!rangeValues) {
-    return Promise.resolve(undefined);
-  }
-
-  const rangeSize = rangeValues.endRange + 1 - rangeValues.startRange;
-  try {
-    // if free port range fails, return undefined
-    return await getFreePortRange(rangeSize);
-  } catch (e) {
-    console.error(e);
+export async function getPortsInfo(portDescriptor: string): Promise<string | undefined> {
+  const localPort = await getPort(portDescriptor);
+  if (!localPort) {
     return undefined;
   }
+  return `${localPort}`;
 }
 
 async function getPort(portDescriptor: string): Promise<number | undefined> {
@@ -111,31 +91,9 @@ async function getPort(portDescriptor: string): Promise<number | undefined> {
     return Promise.resolve(undefined);
   }
   try {
-    // if getFreePort fails, it returns undefined
-    return await getFreePort(port);
+    return await getFreeRandomPort('0.0.0.0');
   } catch (e) {
     console.error(e);
     return undefined;
   }
-}
-
-function getStartEndRange(range: string) {
-  if (range.endsWith('/tcp') || range.endsWith('/udp')) {
-    range = range.substring(0, range.length - 4);
-  }
-
-  const rangeValues = range.split('-');
-  if (rangeValues.length !== 2) {
-    return undefined;
-  }
-  const startRange = parseInt(rangeValues[0]);
-  const endRange = parseInt(rangeValues[1]);
-
-  if (isNaN(startRange) || isNaN(endRange)) {
-    return undefined;
-  }
-  return {
-    startRange,
-    endRange,
-  };
 }

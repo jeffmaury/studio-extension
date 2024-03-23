@@ -16,20 +16,30 @@
  * SPDX-License-Identifier: Apache-2.0
  ***********************************************************************/
 
-import type { ExtensionContext, WebviewOptions, WebviewPanel } from '@podman-desktop/api';
-import { Uri, window } from '@podman-desktop/api';
+import { Uri, window, env } from '@podman-desktop/api';
+import type {
+  ExtensionContext,
+  TelemetryLogger,
+  WebviewOptions,
+  WebviewPanel,
+  WebviewPanelOnDidChangeViewStateEvent,
+} from '@podman-desktop/api';
 import { RpcExtension } from '@shared/src/messages/MessageProxy';
 import { StudioApiImpl } from './studio-api-impl';
 import { ApplicationManager } from './managers/applicationManager';
 import { GitManager } from './managers/gitManager';
-import { RecipeStatusRegistry } from './registries/RecipeStatusRegistry';
 import { TaskRegistry } from './registries/TaskRegistry';
-import { PlayGroundManager } from './managers/playground';
 import { CatalogManager } from './managers/catalogManager';
 import { ModelsManager } from './managers/modelsManager';
 import path from 'node:path';
 import os from 'os';
 import fs from 'node:fs';
+import { ContainerRegistry } from './registries/ContainerRegistry';
+import { PodmanConnection } from './managers/podmanConnection';
+import { LocalRepositoryRegistry } from './registries/LocalRepositoryRegistry';
+import { InferenceManager } from './managers/inference/inferenceManager';
+import { PlaygroundV2Manager } from './managers/playgroundV2Manager';
+import { SnippetManager } from './managers/SnippetManager';
 
 // TODO: Need to be configured
 export const AI_STUDIO_FOLDER = path.join('podman-desktop', 'ai-studio');
@@ -41,9 +51,11 @@ export class Studio {
 
   rpcExtension: RpcExtension;
   studioApi: StudioApiImpl;
-  playgroundManager: PlayGroundManager;
   catalogManager: CatalogManager;
   modelsManager: ModelsManager;
+  telemetry: TelemetryLogger;
+
+  #inferenceManager: InferenceManager;
 
   constructor(readonly extensionContext: ExtensionContext) {
     this.#extensionContext = extensionContext;
@@ -52,10 +64,13 @@ export class Studio {
   public async activate(): Promise<void> {
     console.log('starting studio extension');
 
+    this.telemetry = env.createTelemetryLogger();
+    this.telemetry.logUsage('start');
+
     const extensionUri = this.#extensionContext.extensionUri;
 
     // register webview
-    this.#panel = window.createWebviewPanel('studio', 'Studio extension', this.getWebviewOptions(extensionUri));
+    this.#panel = window.createWebviewPanel('studio', 'AI Studio', this.getWebviewOptions(extensionUri));
     this.#extensionContext.subscriptions.push(this.#panel);
 
     // update html
@@ -94,43 +109,93 @@ export class Studio {
 
     this.#panel.webview.html = indexHtml;
 
+    // Creating container registry
+    const containerRegistry = new ContainerRegistry();
+    this.#extensionContext.subscriptions.push(containerRegistry.init());
+
     // Let's create the api that the front will be able to call
     const appUserDirectory = path.join(os.homedir(), AI_STUDIO_FOLDER);
 
     this.rpcExtension = new RpcExtension(this.#panel.webview);
     const gitManager = new GitManager();
-    const taskRegistry = new TaskRegistry();
-    const recipeStatusRegistry = new RecipeStatusRegistry(taskRegistry, this.#panel.webview);
-    this.playgroundManager = new PlayGroundManager(this.#panel.webview);
+
+    const podmanConnection = new PodmanConnection();
+    const taskRegistry = new TaskRegistry(this.#panel.webview);
+
     // Create catalog manager, responsible for loading the catalog files and watching for changes
-    this.catalogManager = new CatalogManager(appUserDirectory, this.#panel.webview);
-    this.modelsManager = new ModelsManager(appUserDirectory, this.#panel.webview, this.catalogManager);
+    this.catalogManager = new CatalogManager(this.#panel.webview, appUserDirectory);
+    this.modelsManager = new ModelsManager(
+      appUserDirectory,
+      this.#panel.webview,
+      this.catalogManager,
+      this.telemetry,
+      taskRegistry,
+    );
+    const localRepositoryRegistry = new LocalRepositoryRegistry(this.#panel.webview);
     const applicationManager = new ApplicationManager(
       appUserDirectory,
       gitManager,
-      recipeStatusRegistry,
+      taskRegistry,
+      this.#panel.webview,
+      podmanConnection,
+      this.catalogManager,
       this.modelsManager,
+      this.telemetry,
+      localRepositoryRegistry,
     );
+
+    this.#inferenceManager = new InferenceManager(
+      this.#panel.webview,
+      containerRegistry,
+      podmanConnection,
+      this.modelsManager,
+      this.telemetry,
+      taskRegistry,
+    );
+
+    this.#panel.onDidChangeViewState((e: WebviewPanelOnDidChangeViewStateEvent) => {
+      // Lazily init inference manager
+      if (!this.#inferenceManager.isInitialize()) {
+        this.#inferenceManager.init();
+        this.#extensionContext.subscriptions.push(this.#inferenceManager);
+      }
+
+      this.telemetry.logUsage(e.webviewPanel.visible ? 'opened' : 'closed');
+    });
+
+    const playgroundV2 = new PlaygroundV2Manager(this.#panel.webview, this.#inferenceManager, taskRegistry);
+
+    const snippetManager = new SnippetManager(this.#panel.webview);
+    snippetManager.init();
 
     // Creating StudioApiImpl
     this.studioApi = new StudioApiImpl(
-      appUserDirectory,
       applicationManager,
-      recipeStatusRegistry,
-      this.playgroundManager,
       this.catalogManager,
       this.modelsManager,
+      this.telemetry,
+      localRepositoryRegistry,
+      taskRegistry,
+      this.#inferenceManager,
+      playgroundV2,
+      snippetManager,
     );
 
-    await this.catalogManager.loadCatalog();
+    this.catalogManager.init();
     await this.modelsManager.loadLocalModels();
+    podmanConnection.init();
+    applicationManager.adoptRunningApplications();
 
     // Register the instance
     this.rpcExtension.registerInstance<StudioApiImpl>(StudioApiImpl, this.studioApi);
+    this.#extensionContext.subscriptions.push(this.catalogManager);
+    this.#extensionContext.subscriptions.push(this.modelsManager);
+    this.#extensionContext.subscriptions.push(podmanConnection);
   }
 
   public async deactivate(): Promise<void> {
     console.log('stopping studio extension');
+    this.telemetry.logUsage('stop');
   }
 
   getWebviewOptions(extensionUri: Uri): WebviewOptions {

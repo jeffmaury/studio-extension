@@ -17,37 +17,60 @@
  ***********************************************************************/
 
 import type { Recipe } from '@shared/src/models/IRecipe';
-import { arch } from 'node:os';
-import type { GitManager } from './gitManager';
+import type { GitCloneInfo, GitManager } from './gitManager';
 import fs from 'fs';
-import * as https from 'node:https';
 import * as path from 'node:path';
-import { type PodCreatePortOptions, containerEngine } from '@podman-desktop/api';
-import type { RecipeStatusRegistry } from '../registries/RecipeStatusRegistry';
+import {
+  type PodCreatePortOptions,
+  containerEngine,
+  type TelemetryLogger,
+  type PodInfo,
+  type Webview,
+  type HostConfig,
+} from '@podman-desktop/api';
 import type { AIConfig, AIConfigFile, ContainerConfig } from '../models/AIConfig';
-import { parseYaml } from '../models/AIConfig';
+import { parseYamlFile } from '../models/AIConfig';
 import type { Task } from '@shared/src/models/ITask';
-import { RecipeStatusUtils } from '../utils/recipeStatusUtils';
 import { getParentDirectory } from '../utils/pathUtils';
 import type { ModelInfo } from '@shared/src/models/IModelInfo';
 import type { ModelsManager } from './modelsManager';
 import { getPortsInfo } from '../utils/ports';
+import { goarch } from '../utils/arch';
+import { getDurationSecondsSince, timeout } from '../utils/utils';
+import type { LocalRepositoryRegistry } from '../registries/LocalRepositoryRegistry';
+import type { ApplicationState } from '@shared/src/models/IApplicationState';
+import type { PodmanConnection } from './podmanConnection';
+import { Messages } from '@shared/Messages';
+import type { CatalogManager } from './catalogManager';
+import { ApplicationRegistry } from '../registries/ApplicationRegistry';
+import type { TaskRegistry } from '../registries/TaskRegistry';
+import { Publisher } from '../utils/Publisher';
+import { isQEMUMachine } from '../utils/podman';
+
+export const LABEL_MODEL_ID = 'ai-studio-model-id';
+export const LABEL_MODEL_PORTS = 'ai-studio-model-ports';
+
+export const LABEL_RECIPE_ID = 'ai-studio-recipe-id';
+export const LABEL_APP_PORTS = 'ai-studio-app-ports';
 
 export const CONFIG_FILENAME = 'ai-studio.yaml';
-
-interface DownloadModelResult {
-  result: 'ok' | 'failed';
-  error?: string;
-}
 
 interface AIContainers {
   aiConfigFile: AIConfigFile;
   containers: ContainerConfig[];
 }
 
-export interface PodInfo {
+export interface ContainerAttachedInfo {
+  name: string;
+  modelService: boolean;
+  ports: string[];
+}
+
+export interface ApplicationPodInfo {
   engineId: string;
   Id: string;
+  containers?: ContainerAttachedInfo[];
+  portmappings: PodCreatePortOptions[];
 }
 
 export interface ImageInfo {
@@ -57,155 +80,294 @@ export interface ImageInfo {
   appName: string;
 }
 
-export class ApplicationManager {
+export class ApplicationManager extends Publisher<ApplicationState[]> {
+  #applications: ApplicationRegistry<ApplicationState>;
+  protectTasks: Set<string> = new Set();
+
   constructor(
     private appUserDirectory: string,
     private git: GitManager,
-    private recipeStatusRegistry: RecipeStatusRegistry,
+    private taskRegistry: TaskRegistry,
+    webview: Webview,
+    private podmanConnection: PodmanConnection,
+    private catalogManager: CatalogManager,
     private modelsManager: ModelsManager,
-  ) {}
+    private telemetry: TelemetryLogger,
+    private localRepositories: LocalRepositoryRegistry,
+  ) {
+    super(webview, Messages.MSG_APPLICATIONS_STATE_UPDATE, () => this.getApplicationsState());
+    this.#applications = new ApplicationRegistry<ApplicationState>();
+  }
 
   async pullApplication(recipe: Recipe, model: ModelInfo) {
-    // Create a TaskUtils object to help us
-    const taskUtil = new RecipeStatusUtils(recipe.id, this.recipeStatusRegistry);
-
-    const localFolder = path.join(this.appUserDirectory, recipe.id);
-
-    // clone the recipe repository on the local folder
-    await this.doCheckout(recipe.repository, localFolder, taskUtil);
-
-    // load and parse the recipe configuration file and filter containers based on architecture, gpu accelerator
-    // and backend (that define which model supports)
-    const configAndFilteredContainers = this.getConfigAndFilterContainers(recipe.config, localFolder, taskUtil);
-
-    // get model by downloading it or retrieving locally
-    const modelPath = await this.downloadModel(model, taskUtil);
-
-    // build all images, one per container (for a basic sample we should have 2 containers = sample app + model service)
-    const images = await this.buildImages(
-      configAndFilteredContainers.containers,
-      configAndFilteredContainers.aiConfigFile.path,
-      taskUtil,
-    );
-
-    // create a pod containing all the containers to run the application
-    await this.createApplicationPod(images, modelPath, taskUtil);
+    // clear any existing status / tasks related to the pair recipeId-modelId.
+    this.taskRegistry.deleteByLabels({
+      'recipe-id': recipe.id,
+      'model-id': model.id,
+    });
+    return this.startApplication(recipe, model);
   }
 
-  async createApplicationPod(images: ImageInfo[], modelPath: string, taskUtil: RecipeStatusUtils) {
-    // create empty pod
-    let pod: PodInfo;
+  async startApplication(recipe: Recipe, model: ModelInfo) {
+    // const recipeStatus = this.recipeStatusRegistry.
+    const startTime = performance.now();
     try {
-      pod = await this.createPod(images);
-    } catch (e) {
-      console.error('error when creating pod');
-      taskUtil.setTask({
-        id: 'fake-pod-id',
-        state: 'error',
-        name: 'Creating application',
+      const localFolder = path.join(this.appUserDirectory, recipe.id);
+
+      // clone the recipe repository on the local folder
+      const gitCloneInfo: GitCloneInfo = {
+        repository: recipe.repository,
+        ref: recipe.ref,
+        targetDirectory: localFolder,
+      };
+      await this.doCheckout(gitCloneInfo, {
+        'recipe-id': recipe.id,
+        'model-id': model.id,
       });
-      throw e;
+
+      this.localRepositories.register({
+        path: gitCloneInfo.targetDirectory,
+        labels: {
+          'recipe-id': recipe.id,
+        },
+      });
+
+      // load and parse the recipe configuration file and filter containers based on architecture, gpu accelerator
+      // and backend (that define which model supports)
+      const configAndFilteredContainers = this.getConfigAndFilterContainers(recipe.config, localFolder);
+
+      // get model by downloading it or retrieving locally
+      let modelPath = await this.modelsManager.requestDownloadModel(model, {
+        'recipe-id': recipe.id,
+        'model-id': model.id,
+      });
+
+      // upload model to podman machine if user system is supported
+      modelPath = await this.modelsManager.uploadModelToPodmanMachine(model, {
+        'recipe-id': recipe.id,
+        'model-id': model.id,
+      });
+
+      // build all images, one per container (for a basic sample we should have 2 containers = sample app + model service)
+      const images = await this.buildImages(
+        recipe,
+        configAndFilteredContainers.containers,
+        configAndFilteredContainers.aiConfigFile.path,
+        {
+          'recipe-id': recipe.id,
+          'model-id': model.id,
+        },
+      );
+
+      // first delete any existing pod with matching labels
+      if (await this.hasApplicationPod(recipe.id, model.id)) {
+        await this.deleteApplication(recipe.id, model.id);
+      }
+
+      // create a pod containing all the containers to run the application
+      const podInfo = await this.createApplicationPod(recipe, model, images, modelPath, {
+        'recipe-id': recipe.id,
+        'model-id': model.id,
+      });
+
+      await this.runApplication(podInfo, {
+        'recipe-id': recipe.id,
+        'model-id': model.id,
+      });
+      const durationSeconds = getDurationSecondsSince(startTime);
+      this.telemetry.logUsage('recipe.pull', { 'recipe.id': recipe.id, 'recipe.name': recipe.name, durationSeconds });
+    } catch (err: unknown) {
+      const durationSeconds = getDurationSecondsSince(startTime);
+      this.telemetry.logError('recipe.pull', {
+        'recipe.id': recipe.id,
+        'recipe.name': recipe.name,
+        durationSeconds,
+        message: 'error pulling application',
+        error: err,
+      });
+      throw err;
+    }
+  }
+
+  async runApplication(podInfo: ApplicationPodInfo, labels?: { [key: string]: string }) {
+    const task = this.taskRegistry.createTask('Starting AI App', 'loading', labels);
+
+    // it starts the pod
+    await containerEngine.startPod(podInfo.engineId, podInfo.Id);
+
+    // check if all containers have started successfully
+    for (const container of podInfo.containers ?? []) {
+      await this.waitContainerIsRunning(podInfo.engineId, container);
     }
 
-    taskUtil.setTask({
-      id: pod.Id,
-      state: 'loading',
-      name: `Creating application`,
-    });
-
-    await this.createAndAddContainersToPod(pod, images, modelPath);
-
-    taskUtil.setTask({
-      id: pod.Id,
+    // Update task registry
+    this.taskRegistry.updateTask({
+      ...task,
       state: 'success',
-      name: `Creating application`,
+      name: 'AI App is running',
     });
   }
 
-  async createAndAddContainersToPod(pod: PodInfo, images: ImageInfo[], modelPath: string) {
+  async waitContainerIsRunning(engineId: string, container: ContainerAttachedInfo): Promise<void> {
+    const TIME_FRAME_MS = 5000;
+    const MAX_ATTEMPTS = 60 * (60000 / TIME_FRAME_MS); // try for 1 hour
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      const sampleAppContainerInspectInfo = await containerEngine.inspectContainer(engineId, container.name);
+      if (sampleAppContainerInspectInfo.State.Running) {
+        return;
+      }
+      await timeout(TIME_FRAME_MS);
+    }
+    throw new Error(`Container ${container.name} not started in time`);
+  }
+
+  async createApplicationPod(
+    recipe: Recipe,
+    model: ModelInfo,
+    images: ImageInfo[],
+    modelPath: string,
+    labels?: { [key: string]: string },
+  ): Promise<ApplicationPodInfo> {
+    const task = this.taskRegistry.createTask('Creating AI App', 'loading', labels);
+
+    // create empty pod
+    let podInfo: ApplicationPodInfo;
+    try {
+      podInfo = await this.createPod(recipe, model, images);
+      task.labels['pod-id'] = podInfo.Id;
+    } catch (e) {
+      console.error('error when creating pod', e);
+      task.state = 'error';
+      task.error = `Something went wrong while creating pod: ${String(e)}`;
+      throw e;
+    } finally {
+      this.taskRegistry.updateTask(task);
+    }
+
+    let attachedContainers: ContainerAttachedInfo[];
+    try {
+      attachedContainers = await this.createAndAddContainersToPod(podInfo, images, modelPath);
+      task.state = 'success';
+    } catch (e) {
+      console.error(`error when creating pod ${podInfo.Id}`, e);
+      task.state = 'error';
+      task.error = `Something went wrong while creating pod: ${String(e)}`;
+      throw e;
+    } finally {
+      this.taskRegistry.updateTask(task);
+    }
+
+    podInfo.containers = attachedContainers;
+    return podInfo;
+  }
+
+  async createAndAddContainersToPod(
+    podInfo: ApplicationPodInfo,
+    images: ImageInfo[],
+    modelPath: string,
+  ): Promise<ContainerAttachedInfo[]> {
+    const containers: ContainerAttachedInfo[] = [];
+    // temporary check to set Z flag or not - to be removed when switching to podman 5
+    const isQEMUVM = await isQEMUMachine();
     await Promise.all(
       images.map(async image => {
-        let hostConfig: unknown;
+        let hostConfig: HostConfig;
         let envs: string[] = [];
         // if it's a model service we mount the model as a volume
         if (image.modelService) {
           const modelName = path.basename(modelPath);
           hostConfig = {
-            AutoRemove: true,
             Mounts: [
               {
                 Target: `/${modelName}`,
                 Source: modelPath,
                 Type: 'bind',
+                Mode: isQEMUVM ? undefined : 'Z',
               },
             ],
           };
           envs = [`MODEL_PATH=/${modelName}`];
         } else {
-          hostConfig = {
-            AutoRemove: true,
-          };
           // TODO: remove static port
           const modelService = images.find(image => image.modelService);
           if (modelService && modelService.ports.length > 0) {
-            envs = [`MODEL_ENDPOINT=http://localhost:${modelService.ports[0]}`];
+            const endPoint = `http://localhost:${modelService.ports[0]}`;
+            envs = [`MODEL_ENDPOINT=${endPoint}`];
           }
         }
-        const createdContainer = await containerEngine
-          .createContainer(pod.engineId, {
-            Image: image.id,
-            Detach: true,
-            HostConfig: hostConfig,
-            Env: envs,
-            start: false,
-          })
-          .catch((e: unknown) => console.error(e));
 
-        // now, for each container, put it in the pod
-        if (createdContainer) {
-          try {
-            await containerEngine.replicatePodmanContainer(
-              {
-                id: createdContainer.id,
-                engineId: pod.engineId,
-              },
-              { engineId: pod.engineId },
-              { pod: pod.Id, name: this.getRandomName(`${image.appName}-podified`) },
-            );
-          } catch (error) {
-            console.error(error);
-          }
-        }
+        const podifiedName = this.getRandomName(`${image.appName}-podified`);
+        await containerEngine.createContainer(podInfo.engineId, {
+          Image: image.id,
+          name: podifiedName,
+          Detach: true,
+          HostConfig: hostConfig,
+          Env: envs,
+          start: false,
+          pod: podInfo.Id,
+        });
+        containers.push({
+          name: podifiedName,
+          modelService: image.modelService,
+          ports: image.ports,
+        });
       }),
     );
+    return containers;
   }
 
-  async createPod(images: ImageInfo[]): Promise<PodInfo> {
+  async createPod(recipe: Recipe, model: ModelInfo, images: ImageInfo[]): Promise<ApplicationPodInfo> {
     // find the exposed port of the sample app so we can open its ports on the new pod
     const sampleAppImageInfo = images.find(image => !image.modelService);
     if (!sampleAppImageInfo) {
-      console.error('no image found');
+      console.error('no sample app image found');
       throw new Error('no sample app found');
     }
 
     const portmappings: PodCreatePortOptions[] = [];
-    // N.B: it may not work with ranges
-    for (const exposed of sampleAppImageInfo.ports) {
-      const localPorts = await getPortsInfo(exposed);
-      portmappings.push({
-        container_port: parseInt(exposed),
-        host_port: parseInt(localPorts),
-        host_ip: '',
-        protocol: '',
-        range: 1,
-      });
+    // we expose all ports so we can check the model service if it is actually running
+    for (const image of images) {
+      for (const exposed of image.ports) {
+        const localPorts = await getPortsInfo(exposed);
+        portmappings.push({
+          container_port: parseInt(exposed),
+          host_port: parseInt(localPorts),
+          host_ip: '',
+          protocol: '',
+          range: 1,
+        });
+      }
     }
 
     // create new pod
-    return await containerEngine.createPod({
+    const labels = {
+      [LABEL_RECIPE_ID]: recipe.id,
+      [LABEL_MODEL_ID]: model.id,
+    };
+    const modelPorts = images
+      .filter(img => img.modelService)
+      .flatMap(img => img.ports)
+      .map(port => portmappings.find(pm => `${pm.container_port}` === port)?.host_port);
+    if (modelPorts.length) {
+      labels[LABEL_MODEL_PORTS] = modelPorts.join(',');
+    }
+    const appPorts = images
+      .filter(img => !img.modelService)
+      .flatMap(img => img.ports)
+      .map(port => portmappings.find(pm => `${pm.container_port}` === port)?.host_port);
+    if (appPorts.length) {
+      labels[LABEL_APP_PORTS] = appPorts.join(',');
+    }
+    const pod = await containerEngine.createPod({
       name: this.getRandomName(`pod-${sampleAppImageInfo.appName}`),
       portmappings: portmappings,
+      labels,
     });
+    return {
+      Id: pod.Id,
+      engineId: pod.engineId,
+      portmappings: portmappings,
+    };
   }
 
   getRandomName(base: string): string {
@@ -213,37 +375,43 @@ export class ApplicationManager {
   }
 
   async buildImages(
+    recipe: Recipe,
     containers: ContainerConfig[],
     configPath: string,
-    taskUtil: RecipeStatusUtils,
+    labels?: { [key: string]: string },
   ): Promise<ImageInfo[]> {
-    containers.forEach(container => {
-      taskUtil.setTask({
-        id: container.name,
-        state: 'loading',
-        name: `Building ${container.name}`,
-      });
-    });
+    const containerTasks: { [key: string]: Task } = Object.fromEntries(
+      containers.map(container => [
+        container.name,
+        this.taskRegistry.createTask(`Building ${container.name}`, 'loading', labels),
+      ]),
+    );
 
     const imageInfoList: ImageInfo[] = [];
 
     // Promise all the build images
     await Promise.all(
       containers.map(container => {
+        const task = containerTasks[container.name];
+
         // We use the parent directory of our configFile as the rootdir, then we append the contextDir provided
         const context = path.join(getParentDirectory(configPath), container.contextdir);
         console.log(`Application Manager using context ${context} for container ${container.name}`);
 
         // Ensure the context provided exist otherwise throw an Error
         if (!fs.existsSync(context)) {
-          console.error('The context provided does not exist.');
-          taskUtil.setTaskState(container.name, 'error');
+          task.error = 'The context provided does not exist.';
+          this.taskRegistry.updateTask(task);
           throw new Error('Context configured does not exist.');
         }
 
+        const imageTag = this.getImageTag(recipe, container);
         const buildOptions = {
           containerFile: container.containerfile,
-          tag: `${container.name}:latest`,
+          tag: imageTag,
+          labels: {
+            [LABEL_RECIPE_ID]: labels !== undefined && 'recipe-id' in labels ? labels['recipe-id'] : undefined,
+          },
         };
 
         return containerEngine
@@ -253,14 +421,15 @@ export class ApplicationManager {
               // todo: do something with the event
               if (event === 'error' || (event === 'finish' && data !== '')) {
                 console.error('Something went wrong while building the image: ', data);
-                taskUtil.setTaskState(container.name, 'error');
+                task.error = `Something went wrong while building the image: ${data}`;
+                this.taskRegistry.updateTask(task);
               }
             },
             buildOptions,
           )
           .catch((err: unknown) => {
-            console.error('Something went wrong while building the image: ', err);
-            taskUtil.setTaskState(container.name, 'error');
+            task.error = `Something went wrong while building the image: ${String(err)}`;
+            this.taskRegistry.updateTask(task);
             throw new Error(`Something went wrong while building the image: ${String(err)}`);
           });
       }),
@@ -270,54 +439,57 @@ export class ApplicationManager {
     const images = await containerEngine.listImages();
     await Promise.all(
       containers.map(async container => {
+        const task = containerTasks[container.name];
+        const imageTag = this.getImageTag(recipe, container);
+
         const image = images.find(im => {
-          return im.RepoTags?.some(tag => tag.endsWith(`${container.name}:latest`));
+          return im.RepoTags?.some(tag => tag.endsWith(imageTag));
         });
 
         if (!image) {
-          console.error('no image found');
-          taskUtil.setTaskState(container.name, 'error');
+          task.error = `no image found for ${container.name}:latest`;
+          this.taskRegistry.updateTask(task);
           throw new Error(`no image found for ${container.name}:latest`);
         }
-
-        const imageInspectInfo = await containerEngine.getImageInspect(image.engineId, image.Id);
-        const exposedPorts = Array.from(Object.keys(imageInspectInfo?.Config?.ExposedPorts || {})).map(port => {
-          if (port.endsWith('/tcp') || port.endsWith('/udp')) {
-            return port.substring(0, port.length - 4);
-          }
-          return port;
-        });
 
         imageInfoList.push({
           id: image.Id,
           modelService: container.modelService,
-          ports: exposedPorts,
+          ports: container.ports?.map(p => `${p}`) ?? [],
           appName: container.name,
         });
 
-        taskUtil.setTaskState(container.name, 'success');
+        task.state = 'success';
+        this.taskRegistry.updateTask(task);
       }),
     );
 
     return imageInfoList;
   }
 
-  getConfigAndFilterContainers(recipeConfig: string, localFolder: string, taskUtil: RecipeStatusUtils): AIContainers {
+  getImageTag(recipe: Recipe, container: ContainerConfig) {
+    let tag = container.image ?? `${recipe.id}-${container.name}`;
+    if (!tag.includes(':')) {
+      tag += ':latest';
+    }
+    return tag;
+  }
+
+  getConfigAndFilterContainers(
+    recipeConfig: string,
+    localFolder: string,
+    labels?: { [key: string]: string },
+  ): AIContainers {
     // Adding loading configuration task
-    const loadingConfiguration: Task = {
-      id: 'loading-config',
-      name: 'Loading configuration',
-      state: 'loading',
-    };
-    taskUtil.setTask(loadingConfiguration);
+    const task = this.taskRegistry.createTask('Loading configuration', 'loading', labels);
 
     let aiConfigFile: AIConfigFile;
     try {
       // load and parse the recipe configuration file
       aiConfigFile = this.getConfiguration(recipeConfig, localFolder);
     } catch (e) {
-      loadingConfiguration.state = 'error';
-      taskUtil.setTask(loadingConfiguration);
+      task.error = `Something went wrong while loading configuration: ${String(e)}.`;
+      this.taskRegistry.updateTask(task);
       throw e;
     }
 
@@ -325,12 +497,12 @@ export class ApplicationManager {
     const filteredContainers: ContainerConfig[] = this.filterContainers(aiConfigFile.aiConfig);
     if (filteredContainers.length > 0) {
       // Mark as success.
-      loadingConfiguration.state = 'success';
-      taskUtil.setTask(loadingConfiguration);
+      task.state = 'success';
+      this.taskRegistry.updateTask(task);
     } else {
       // Mark as failure.
-      loadingConfiguration.state = 'error';
-      taskUtil.setTask(loadingConfiguration);
+      task.error = 'No containers available.';
+      this.taskRegistry.updateTask(task);
       throw new Error('No containers available.');
     }
 
@@ -342,34 +514,8 @@ export class ApplicationManager {
 
   filterContainers(aiConfig: AIConfig): ContainerConfig[] {
     return aiConfig.application.containers.filter(
-      container => container.arch === undefined || container.arch === arch(),
+      container => container.gpu_env.length === 0 && container.arch.some(arc => arc === goarch()),
     );
-  }
-
-  async downloadModel(model: ModelInfo, taskUtil: RecipeStatusUtils) {
-    if (!this.modelsManager.isModelOnDisk(model.id)) {
-      // Download model
-      taskUtil.setTask({
-        id: model.id,
-        state: 'loading',
-        name: `Downloading model ${model.name}`,
-        labels: {
-          'model-pulling': model.id,
-        },
-      });
-
-      return await this.doDownloadModelWrapper(model.id, model.url, taskUtil);
-    } else {
-      taskUtil.setTask({
-        id: model.id,
-        state: 'success',
-        name: `Model ${model.name} already present on disk`,
-        labels: {
-          'model-pulling': model.id,
-        },
-      });
-      return this.modelsManager.getLocalModelPath(model.id);
-    }
   }
 
   getConfiguration(recipeConfig: string, localFolder: string): AIConfigFile {
@@ -395,12 +541,12 @@ export class ApplicationManager {
 
     // Parsing the configuration
     console.log(`Reading configuration from ${configFile}.`);
-    const rawConfiguration = fs.readFileSync(configFile, 'utf-8');
     let aiConfig: AIConfig;
     try {
-      aiConfig = parseYaml(rawConfiguration, arch());
+      aiConfig = parseYamlFile(configFile, goarch());
     } catch (err) {
-      throw new Error('Cannot load configuration file.');
+      console.error('Cannot load configure file.', err);
+      throw new Error(`Cannot load configuration file.`);
     }
 
     // Mark as success.
@@ -410,121 +556,259 @@ export class ApplicationManager {
     };
   }
 
-  async doCheckout(repository: string, localFolder: string, taskUtil: RecipeStatusUtils) {
-    // Adding checkout task
-    const checkoutTask: Task = {
-      id: 'checkout',
-      name: 'Checkout repository',
-      state: 'loading',
-      labels: {
-        git: 'checkout',
-      },
-    };
-    taskUtil.setTask(checkoutTask);
-
-    // We might already have the repository cloned
-    if (fs.existsSync(localFolder) && fs.statSync(localFolder).isDirectory()) {
-      // Update checkout state
-      checkoutTask.name = 'Checkout repository (cached).';
-      checkoutTask.state = 'success';
-    } else {
-      // Create folder
-      fs.mkdirSync(localFolder, { recursive: true });
-
-      // Clone the repository
-      console.log(`Cloning repository ${repository} in ${localFolder}.`);
-      await this.git.cloneRepository(repository, localFolder);
-
-      // Update checkout state
-      checkoutTask.state = 'success';
-    }
-    // Update task
-    taskUtil.setTask(checkoutTask);
-  }
-
-  doDownloadModelWrapper(
-    modelId: string,
-    url: string,
-    taskUtil: RecipeStatusUtils,
-    destFileName?: string,
-  ): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const downloadCallback = (result: DownloadModelResult) => {
-        if (result.result) {
-          taskUtil.setTaskState(modelId, 'success');
-          resolve(destFileName);
-        } else {
-          taskUtil.setTaskState(modelId, 'error');
-          reject(result.error);
-        }
-      };
-
-      if (fs.existsSync(destFileName)) {
-        taskUtil.setTaskState(modelId, 'success');
-        taskUtil.setTaskProgress(modelId, 100);
-        return;
-      }
-
-      this.doDownloadModel(modelId, url, taskUtil, downloadCallback, destFileName);
+  async doCheckout(gitCloneInfo: GitCloneInfo, labels?: { [id: string]: string }): Promise<void> {
+    // Creating checkout task
+    const checkoutTask: Task = this.taskRegistry.createTask('Checking out repository', 'loading', {
+      ...labels,
+      git: 'checkout',
     });
+
+    const installed = await this.git.isGitInstalled();
+    if (!installed) {
+      checkoutTask.state = 'error';
+      checkoutTask.error = 'Git is not installed or cannot be found.';
+      this.taskRegistry.updateTask(checkoutTask);
+      // propagate error
+      throw new Error(checkoutTask.error);
+    }
+
+    try {
+      await this.git.processCheckout(gitCloneInfo);
+      checkoutTask.state = 'success';
+    } catch (err: unknown) {
+      checkoutTask.state = 'error';
+      checkoutTask.error = String(err);
+      // propagate error
+      throw err;
+    } finally {
+      // Update task registry
+      this.taskRegistry.updateTask(checkoutTask);
+    }
   }
 
-  private doDownloadModel(
-    modelId: string,
-    url: string,
-    taskUtil: RecipeStatusUtils,
-    callback: (message: DownloadModelResult) => void,
-    destFileName?: string,
-  ) {
-    const destDir = path.join(this.appUserDirectory, 'models', modelId);
-    if (!fs.existsSync(destDir)) {
-      fs.mkdirSync(destDir, { recursive: true });
-    }
-    if (!destFileName) {
-      destFileName = path.basename(url);
-    }
-    const destFile = path.resolve(destDir, destFileName);
-    const file = fs.createWriteStream(destFile);
-    let totalFileSize = 0;
-    let progress = 0;
-    https.get(url, resp => {
-      if (resp.headers.location) {
-        this.doDownloadModel(modelId, resp.headers.location, taskUtil, callback, destFileName);
+  adoptRunningApplications() {
+    this.podmanConnection.startupSubscribe(() => {
+      if (!containerEngine.listPods) {
+        // TODO(feloy) this check can be safely removed when podman desktop 1.8 is released
+        // and the extension minimal version is set to 1.8
         return;
-      } else {
-        if (totalFileSize === 0 && resp.headers['content-length']) {
-          totalFileSize = parseFloat(resp.headers['content-length']);
-        }
       }
-
-      let previousProgressValue = -1;
-      resp.on('data', chunk => {
-        progress += chunk.length;
-        const progressValue = (progress * 100) / totalFileSize;
-
-        if (progressValue === 100 || progressValue - previousProgressValue > 1) {
-          previousProgressValue = progressValue;
-          taskUtil.setTaskProgress(modelId, progressValue);
-        }
-
-        // send progress in percentage (ex. 1.2%, 2.6%, 80.1%) to frontend
-        //this.sendProgress(progressValue);
-        if (progressValue === 100) {
-          callback({
-            result: 'ok',
-          });
-        }
-      });
-      file.on('finish', () => {
-        file.close();
-      });
-      file.on('error', e => {
-        callback({
-          result: 'failed',
-          error: e.message,
+      containerEngine
+        .listPods()
+        .then(pods => {
+          const appsPods = pods.filter(pod => LABEL_RECIPE_ID in pod.Labels);
+          for (const podToAdopt of appsPods) {
+            this.adoptPod(podToAdopt);
+          }
+        })
+        .catch((err: unknown) => {
+          console.error('error during adoption of existing playground containers', err);
         });
-      });
-      resp.pipe(file);
     });
+
+    this.podmanConnection.onMachineStop(() => {
+      // Podman Machine has been stopped, we consider all recipe pods are stopped
+      for (const recipeModelIndex of this.#applications.keys()) {
+        this.taskRegistry.createTask('AI App stopped manually', 'success', {
+          'recipe-id': recipeModelIndex.recipeId,
+          'model-id': recipeModelIndex.modelId,
+        });
+      }
+
+      this.#applications.clear();
+      this.notify();
+    });
+
+    this.podmanConnection.onPodStart((pod: PodInfo) => {
+      this.adoptPod(pod);
+    });
+    this.podmanConnection.onPodStop((pod: PodInfo) => {
+      this.forgetPod(pod);
+    });
+    this.podmanConnection.onPodRemove((podId: string) => {
+      this.forgetPodById(podId);
+    });
+  }
+
+  adoptPod(pod: PodInfo) {
+    if (!pod.Labels) {
+      return;
+    }
+    const recipeId = pod.Labels[LABEL_RECIPE_ID];
+    const modelId = pod.Labels[LABEL_MODEL_ID];
+    const appPorts = this.getPortsFromLabel(pod.Labels, LABEL_APP_PORTS);
+    const modelPorts = this.getPortsFromLabel(pod.Labels, LABEL_MODEL_PORTS);
+    if (this.#applications.has({ recipeId, modelId })) {
+      return;
+    }
+    const state: ApplicationState = {
+      recipeId,
+      modelId,
+      pod,
+      appPorts,
+      modelPorts,
+    };
+    this.updateApplicationState(recipeId, modelId, state);
+  }
+
+  forgetPod(pod: PodInfo) {
+    if (!pod.Labels) {
+      return;
+    }
+    const recipeId = pod.Labels[LABEL_RECIPE_ID];
+    const modelId = pod.Labels[LABEL_MODEL_ID];
+    if (!this.#applications.has({ recipeId, modelId })) {
+      return;
+    }
+    this.#applications.delete({ recipeId, modelId });
+    this.notify();
+
+    const protect = this.protectTasks.has(pod.Id);
+    if (!protect) {
+      this.taskRegistry.createTask('AI App stopped manually', 'success', {
+        'recipe-id': recipeId,
+        'model-id': modelId,
+      });
+    } else {
+      this.protectTasks.delete(pod.Id);
+    }
+  }
+
+  forgetPodById(podId: string) {
+    const app = Array.from(this.#applications.values()).find(p => p.pod.Id === podId);
+    if (!app) {
+      return;
+    }
+    if (!app.pod.Labels) {
+      return;
+    }
+    const recipeId = app.pod.Labels[LABEL_RECIPE_ID];
+    const modelId = app.pod.Labels[LABEL_MODEL_ID];
+    if (!this.#applications.has({ recipeId, modelId })) {
+      return;
+    }
+    this.#applications.delete({ recipeId, modelId });
+    this.notify();
+
+    const protect = this.protectTasks.has(podId);
+    if (!protect) {
+      this.taskRegistry.createTask('AI App stopped manually', 'success', {
+        'recipe-id': recipeId,
+        'model-id': modelId,
+      });
+    } else {
+      this.protectTasks.delete(podId);
+    }
+  }
+
+  updateApplicationState(recipeId: string, modelId: string, state: ApplicationState): void {
+    this.#applications.set({ recipeId, modelId }, state);
+    this.notify();
+  }
+
+  getApplicationsState(): ApplicationState[] {
+    return Array.from(this.#applications.values());
+  }
+
+  async deleteApplication(recipeId: string, modelId: string) {
+    // clear any existing status / tasks related to the pair recipeId-modelId.
+    this.taskRegistry.deleteByLabels({
+      'recipe-id': recipeId,
+      'model-id': modelId,
+    });
+
+    const stoppingTask = this.taskRegistry.createTask(`Stopping AI App`, 'loading', {
+      'recipe-id': recipeId,
+      'model-id': modelId,
+    });
+    try {
+      const appPod = await this.getApplicationPod(recipeId, modelId);
+      try {
+        await containerEngine.stopPod(appPod.engineId, appPod.Id);
+      } catch (err: unknown) {
+        // continue when the pod is already stopped
+        if (!String(err).includes('pod already stopped')) {
+          stoppingTask.error = 'error stopping the pod. Please try to stop and remove the pod manually';
+          stoppingTask.name = 'Error stopping AI App';
+          this.taskRegistry.updateTask(stoppingTask);
+          throw err;
+        }
+      }
+      this.protectTasks.add(appPod.Id);
+      await containerEngine.removePod(appPod.engineId, appPod.Id);
+
+      stoppingTask.state = 'success';
+      stoppingTask.name = `AI App stopped`;
+    } catch (err: unknown) {
+      stoppingTask.error = 'error removing the pod. Please try to remove the pod manually';
+      stoppingTask.name = 'Error stopping AI App';
+      throw err;
+    } finally {
+      this.taskRegistry.updateTask(stoppingTask);
+    }
+  }
+
+  async restartApplication(recipeId: string, modelId: string) {
+    const appPod = await this.getApplicationPod(recipeId, modelId);
+    await this.deleteApplication(recipeId, modelId);
+    const recipe = this.catalogManager.getRecipeById(recipeId);
+    const model = this.catalogManager.getModelById(appPod.Labels[LABEL_MODEL_ID]);
+    await this.startApplication(recipe, model);
+  }
+
+  async getApplicationPorts(recipeId: string, modelId: string): Promise<number[]> {
+    const recipe = this.catalogManager.getRecipeById(recipeId);
+    const state = this.#applications.get({ recipeId, modelId });
+    if (state) {
+      return state.appPorts;
+    }
+    throw new Error(`Recipe ${recipe.name} has no ports available`);
+  }
+
+  async getApplicationPod(recipeId: string, modelId: string): Promise<PodInfo> {
+    const appPod = await this.queryPod(recipeId, modelId);
+    if (!appPod) {
+      throw new Error(`no pod found with recipe Id ${recipeId} and model Id ${modelId}`);
+    }
+    return appPod;
+  }
+
+  async hasApplicationPod(recipeId: string, modelId: string): Promise<boolean> {
+    const appPod = await this.queryPod(recipeId, modelId);
+    return !!appPod;
+  }
+
+  async queryPod(recipeId: string, modelId: string): Promise<PodInfo | undefined> {
+    if (!containerEngine.listPods || !containerEngine.stopPod || !containerEngine.removePod) {
+      // TODO(feloy) this check can be safely removed when podman desktop 1.8 is released
+      // and the extension minimal version is set to 1.8
+      return;
+    }
+    const pods = await containerEngine.listPods();
+    return pods.find(
+      pod =>
+        LABEL_RECIPE_ID in pod.Labels &&
+        pod.Labels[LABEL_RECIPE_ID] === recipeId &&
+        LABEL_MODEL_ID in pod.Labels &&
+        pod.Labels[LABEL_MODEL_ID] === modelId,
+    );
+  }
+
+  getPortsFromLabel(labels: { [key: string]: string }, key: string): number[] {
+    if (!(key in labels)) {
+      return [];
+    }
+    const value = labels[key];
+    const portsStr = value.split(',');
+    const result: number[] = [];
+    for (const portStr of portsStr) {
+      const port = parseInt(portStr, 10);
+      if (isNaN(port)) {
+        // malformed label, just ignore it
+        return [];
+      }
+      result.push(port);
+    }
+    return result;
   }
 }
