@@ -1,4 +1,6 @@
 # AI studio
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fjeffmaury%2Fai-lab.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fjeffmaury%2Fai-lab?ref=badge_shield)
+
 
 The Podman Desktop AI Studio extension simplifies getting started and developing with AI in a local environment.  It provides key open-source technologies to start building on AI.  A curated catalog of so-called recipes helps navigate the jungle of AI use cases and AI models.  AI Studio further ships playgrounds: environments to experiment with and test AI models, for instance, a chat bot.
 
@@ -60,3 +62,7 @@ Sample applications may be added to the catalog. See [packaging guide](PACKAGING
 ## Feedback
 
 You can provide your feedback on the extension with [this form](https://forms.gle/tctQ4RtZSiMyQr3R8) or create [an issue on this repository](https://github.com/projectatomic/studio-extension/issues).
+
+
+## License
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fjeffmaury%2Fai-lab.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fjeffmaury%2Fai-lab?ref=badge_large)
