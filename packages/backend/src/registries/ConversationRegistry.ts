@@ -123,8 +123,8 @@ export class ConversationRegistry extends Publisher<Conversation[]> implements D
     //this code get an initialized database so that default user is not admin thus did not get the initial
     //welcome modal dialog
     await fs.promises.copyFile(
-      path.join(__dirname, '..', 'src', 'assets', 'webui.db'),
-      path.join(conversationFolder, 'webui.db'),
+      path.join(__dirname, '..', 'src', 'assets', 'config.json'),
+      path.join(conversationFolder, 'config.json'),
     );
     this.#conversations.set(conversationId, {
       name: name,
